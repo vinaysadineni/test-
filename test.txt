@@ -1,0 +1,172 @@
+/**
+ * Helper class used to keep a Certification's Office and Company
+ * in sync with its associated Contact's Office and Company
+ *
+ * @author Tyler Trepanier, Traction on Demand
+ * @date 2018-04-30
+ */
+public without sharing class trac_CertificationSyncHelper {
+
+    private static Map<Id, Contact> processedContacts = new Map<Id, Contact>();
+    private static fflib_ISObjectUnitOfWork uow = new fflib_SObjectUnitOfWork(
+            new List<Schema.SObjectType>{
+                    Contact.sObjectType,
+                    Certification__c.sObjectType
+            }
+    );
+
+    private Map<Id, Certification__c> oldCertifications;
+    private List<Certification__c> certifications = new List<Certification__c>();
+    private Map<Id, Contact> oldContacts = new Map<Id, Contact>();
+    private List<Contact> contacts = new List<Contact>();
+
+    /**
+     * Constructor
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     *
+     * @param certifications    New Certifications
+     * @param oldCertifications Old Certifications
+     */
+    public trac_CertificationSyncHelper(List<Certification__c> certifications, Map<Id, Certification__c> oldCertifications) {
+        this.certifications = certifications;
+        this.oldCertifications = oldCertifications;
+    }
+
+    public trac_CertificationSyncHelper(List<Contact> contacts, Map<Id, Contact> oldContacts) {
+        this.contacts = contacts;
+        this.oldContacts = oldContacts;
+    }
+
+    /**
+     * Used in the Before Insert and Before Update Certification trigger:
+     * Update All Certifications where the Certification's Office and Company does not match
+     * that of its Contact
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     * @param certifications New Certifications
+     */
+    public void processCertifications() {
+        Set<Id> contactIds = trac_ListUtils.collectIds(certifications, Certification__c.Contact__c);
+        Map<Id, Contact> relatedBHHSContacts = new Map<Id, Contact>(new trac_ContactSelector().selectById(contactIds));
+        for (Certification__c certification : certifications) {
+
+            // Use the processedContacts map first just in case we are currently updating the Contacts
+            // and want to prevent updating the certification with the old value of the contact
+            Contact relatedContact = processedContacts.get(certification.Contact__c) != null
+                    ? processedContacts.get(certification.Contact__c)
+                    : relatedBHHSContacts.get(certification.Contact__c);
+
+            if(meetsRequirements(certification, relatedContact)) {
+                certification.Company_Account__c = relatedContact.Company__c;
+                certification.Office_Account__c = relatedContact.AccountId;
+            }
+        }
+    }
+
+    /**
+     * Only update Certifications where their Office and Company doesn't match the Contact's
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     * @param certification Certification to verify
+     * @param bhhsContact   Contact to compare against
+     *
+     * @return Boolean for needs updating
+     */
+    private Boolean meetsRequirements(Certification__c certification, Contact bhhsContact) {
+        if(bhhsContact != null &&
+            (
+                bhhsContact.AccountId != certification.Office_Account__c ||
+                bhhsContact.Company__c != certification.Company_Account__c
+            )
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Return true if a contact's AccountId or Company__c changed
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     * @param oldContact Old Contact
+     * @param newContact New Contact
+     *
+     * @return AccountId or Company__c changed
+     */
+    private Boolean meetsRequirements(Contact oldContact, Contact newContact) {
+        if(oldContact != null &&
+            (
+                oldContact.AccountId != newContact.AccountId ||
+                oldContact.Company__c != newContact.Company__c ||
+                oldContact.Status__c != newContact.Status__c
+            )
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Return a list of contacts that had its Office or Company changed
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     * @param contacts    New Contacts
+     * @param oldContacts Old Contacts
+     *
+     * @return All Contacts that had its AccountId or Company__c changed
+     */
+    private List<Contact> filterContacts(List<Contact> contacts, Map<Id, Contact> oldContacts) {
+        List<Contact> updatedContacts = new List<Contact>();
+        for(Contact newContact : contacts) {
+            Contact oldContact = oldContacts.get(newContact.Id);
+            if(meetsRequirements(oldContact, newContact)){
+                updatedContacts.add(newContact);
+            }
+        }
+        return updatedContacts;
+    }
+
+    /**
+     * Executes during the After Update Trigger, whenever a contact's Office and Company changes.
+     * Any certification tied to a contact will have its Office and Company adjusted as well.
+     *
+     * @author Tyler Trepanier, Traction on Demand
+     * @date 2018-04-30
+     * @param contacts    New Contacts
+     * @param oldContacts Old Contacts
+     */
+    public void processContacts() {
+        List<Contact> updatedContacts = filterContacts(contacts, oldContacts);
+        if(updatedContacts.isEmpty()){
+            return;
+        }
+
+        Map<Id, Contact> relatedBHHSContacts = new Map<Id, Contact>(updatedContacts);
+        List<Certification__c> certificationsToSync = new List<Certification__c>();
+        List<Certification__c> relatedCertifications = new trac_CertificationSelector().selectByContactIdWithoutSharing(relatedBHHSContacts.keySet());
+
+        for (Certification__c certification : relatedCertifications) {
+            Contact relatedContact = relatedBHHSContacts.get(certification.Contact__c);
+            if(meetsRequirements(certification, relatedContact)) {
+
+                certification.Company_Account__c = relatedContact.Company__c;
+                certification.Office_Account__c = relatedContact.AccountId;
+                certificationsToSync.add(certification);
+
+                // We will use this map later when we update certifications in order to prevent
+                // Certifications being updated with the old contact's value instead of the new ones
+                // that we do want :)
+                processedContacts.put(relatedContact.Id, relatedContact);
+            }
+        }
+
+        uow.registerDirty(certificationsToSync);
+        uow.commitWork();
+    }
+}
